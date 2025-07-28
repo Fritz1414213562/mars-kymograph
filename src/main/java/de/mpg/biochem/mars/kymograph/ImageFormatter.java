@@ -73,6 +73,7 @@ public class ImageFormatter {
     private LogService logService;
 
     private ImagePlus imp;
+    private ImagePlus mergedImage;
 
     private final Map<Integer, Double> displayRangeCtoMin, displayRangeCtoMax;
     private final Map<Integer, String> cToLUTName;
@@ -129,6 +130,7 @@ public class ImageFormatter {
     private Font title_font = new Font("Arial", Font.PLAIN, 16);
 
     private int singleChannelToShow = -1; // -1 means show all channels
+    private int[] multipleChannelsToShow = null; // null means show all channels
 
     public ImageFormatter(Context context, Dataset kymograph) {
         context.inject(this);
@@ -136,6 +138,11 @@ public class ImageFormatter {
         displayRangeCtoMin = new HashMap<>();
         displayRangeCtoMax = new HashMap<>();
         cToLUTName = new HashMap<>();
+
+        //Set default colors
+        cToLUTName.put(1, "Blue");
+        cToLUTName.put(2, "Magenta");
+        cToLUTName.put(3, "Green");
     }
 
     public ImageFormatter setAxisFontSize(int fontSize) {
@@ -340,6 +347,7 @@ public class ImageFormatter {
         if (channelIndices == null || channelIndices.length == 0) {
             logService.warn("No channel indices provided. Showing all channels.");
             this.singleChannelToShow = -1;
+            this.multipleChannelsToShow = null;
             return this;
         }
 
@@ -353,89 +361,14 @@ public class ImageFormatter {
 
         // If only one channel requested, use the existing onlyShowChannel method
         if (channelIndices.length == 1) {
+            this.multipleChannelsToShow = null;
             return onlyShowChannel(channelIndices[0]);
         }
 
-        // Extract the specified channels
-        extractMultipleChannels(channelIndices);
+        // Store the channel selection for later use
+        this.multipleChannelsToShow = channelIndices.clone();
+        this.singleChannelToShow = -1; // Clear single channel selection
         return this;
-    }
-
-    /**
-     * Helper method to extract multiple channels from a multi-channel image
-     *
-     * @param channelIndices Array of 1-based channel indices to extract
-     */
-    private void extractMultipleChannels(int[] channelIndices) {
-        if (imp.getNChannels() == 1) {
-            // Already a single channel image, nothing to do
-            return;
-        }
-
-        // Save the current position
-        int currentC = imp.getC();
-        int currentZ = imp.getZ();
-        int currentT = imp.getT();
-
-        int width = imp.getWidth();
-        int height = imp.getHeight();
-        int slices = imp.getNSlices();
-        int frames = imp.getNFrames();
-
-        // Create a new stack for the selected channels
-        ImageStack newStack = new ImageStack(width, height);
-
-        // For each time point and Z slice
-        for (int t = 1; t <= frames; t++) {
-            for (int z = 1; z <= slices; z++) {
-                // Add each selected channel to the stack
-                for (int i = 0; i < channelIndices.length; i++) {
-                    int c = channelIndices[i];
-                    imp.setPosition(c, z, t);
-                    ImageProcessor processor = imp.getProcessor().duplicate();
-                    newStack.addSlice(processor);
-                }
-            }
-        }
-
-        // Create new ImagePlus with the extracted channels
-        ImagePlus newImp = new ImagePlus(imp.getTitle() + " - Selected Channels", newStack);
-
-        // Set dimensions (now with only the selected channels)
-        newImp.setDimensions(channelIndices.length, slices, frames);
-
-        // Copy display ranges and LUTs for the selected channels
-        for (int i = 0; i < channelIndices.length; i++) {
-            int oldC = channelIndices[i];
-            int newC = i + 1; // 1-based indexing for new channels
-
-            // Set display range if specified
-            if (displayRangeCtoMin.containsKey(oldC)) {
-                double min = displayRangeCtoMin.get(oldC);
-                double max = displayRangeCtoMax.containsKey(oldC) ?
-                        displayRangeCtoMax.get(oldC) :
-                        imp.getDisplayRangeMax();
-
-                // Store for the new channel index
-                displayRangeCtoMin.put(newC, min);
-                displayRangeCtoMax.put(newC, max);
-            }
-
-            // Transfer LUT settings
-            if (cToLUTName.containsKey(oldC)) {
-                cToLUTName.put(newC, cToLUTName.get(oldC));
-            }
-        }
-
-        // Replace imp with this new multi-channel image
-        imp = newImp;
-
-        // Restore the position as close as possible
-        imp.setPosition(
-                Math.min(currentC, channelIndices.length),
-                Math.min(currentZ, slices),
-                Math.min(currentT, frames)
-        );
     }
 
     /**
@@ -477,14 +410,19 @@ public class ImageFormatter {
 
     public void build() {
         // If only showing a single channel, extract it before proceeding
+        mergedImage = imp;
         if (singleChannelToShow > 0) {
-            extractSingleChannel();
+            mergedImage = extractChannelsToNewImage(singleChannelToShow);
         }
 
-        for (int c=1; c<=imp.getNChannels(); c++) {
-            imp.setC(c);
-            updateChannelColor(imp, c);
+        if (multipleChannelsToShow != null) {
+            mergedImage = extractChannelsToNewImage(multipleChannelsToShow);
         }
+        if (multipleChannelsToShow == null && singleChannelToShow == -1) {
+            multipleChannelsToShow = new int[imp.getNChannels()];
+            for (int c=1; c<=imp.getNChannels(); c++) multipleChannelsToShow[c - 1] = c;
+        }
+        mergedImage = mergedImage.resize(mergedImage.getWidth()*rescaleFactor, mergedImage.getHeight()*rescaleFactor, 1, "none");
         imp = imp.resize(imp.getWidth()*rescaleFactor, imp.getHeight()*rescaleFactor, 1, "none");
 
         // Calculate dimensions based on orientation
@@ -495,18 +433,18 @@ public class ImageFormatter {
             // - Width becomes: main image column + additional channel columns + margins
             // - Height becomes: rotated width + margins
 
-            int mainColumnWidth = imp.getHeight(); // After rotation, height becomes width
+            int mainColumnWidth = mergedImage.getHeight(); // After rotation, height becomes width
 
-            if (channelStack && imp.getNChannels() > 1) {
+            if (channelStack && mergedImage.getNChannels() > 1) {
                 // Calculate total width needed for all columns with proper spacing
                 // Main column + spacing + (each channel column + spacing between columns)
                 fullWidth = mainColumnWidth +
                         // Add initial spacing after main image
                         channelStackspacing +
                         // Add width for all channels
-                        (imp.getNChannels() * mainColumnWidth) +
+                        (mergedImage.getNChannels() * mainColumnWidth) +
                         // Add spacing between all channel columns
-                        ((imp.getNChannels() - 1) * channelStackspacing) +
+                        ((mergedImage.getNChannels() - 1) * channelStackspacing) +
                         // Add margins
                         (horizontalMargin * 2);
 
@@ -515,19 +453,19 @@ public class ImageFormatter {
             } else {
                 // Single channel or no stacking - just the main column
                 fullWidth = mainColumnWidth + (horizontalMargin * 2);
-                fullHeight = imp.getWidth() + (verticalMargin * 2);
+                fullHeight = mergedImage.getWidth() + (verticalMargin * 2);
             }
         } else {
             // Standard horizontal orientation
-            if (channelStack && imp.getNChannels() > 1) {
-                fullWidth = imp.getWidth() + (horizontalMargin * 2);
-                fullHeight = imp.getHeight() +
-                        (imp.getNChannels() * imp.getHeight()) +
-                        (imp.getNChannels() * channelStackspacing) +
+            if (channelStack && mergedImage.getNChannels() > 1) {
+                fullWidth = mergedImage.getWidth() + (horizontalMargin * 2);
+                fullHeight = mergedImage.getHeight() +
+                        (mergedImage.getNChannels() * mergedImage.getHeight()) +
+                        (mergedImage.getNChannels() * channelStackspacing) +
                         (verticalMargin * 2);
             } else {
-                fullWidth = imp.getWidth() + (horizontalMargin * 2);
-                fullHeight = imp.getHeight() + (verticalMargin * 2);
+                fullWidth = mergedImage.getWidth() + (horizontalMargin * 2);
+                fullHeight = mergedImage.getHeight() + (verticalMargin * 2);
             }
         }
 
@@ -540,7 +478,7 @@ public class ImageFormatter {
         Graphics2D g2d = image.createGraphics();
 
         // Draw everything to the bitmap
-        drawToGraphics(g2d);
+        drawToGraphics(mergedImage, g2d);
         g2d.dispose();
 
         try {
@@ -555,66 +493,83 @@ public class ImageFormatter {
     }
 
     /**
-     * Helper method to extract a single channel from a multi-channel image
+     * Creates a new ImagePlus containing only the specified channels from the global imp.
+     * Applies the correct display settings and LUTs based on the original channel indices.
+     *
+     * @param channelIndices Variable number of 1-based channel indices to extract from the original image
+     * @return A new ImagePlus with only the specified channels and their settings applied
      */
-    private void extractSingleChannel() {
-        if (imp.getNChannels() == 1) {
-            // Already a single channel image, nothing to do
-            return;
+    private ImagePlus extractChannelsToNewImage(int... channelIndices) {
+        if (channelIndices == null || channelIndices.length == 0) {
+            // Return a copy of the original image if no specific channels requested
+            return imp.duplicate();
         }
 
-        // Set to the channel we want to extract
-        imp.setC(singleChannelToShow);
+        if (imp.getNChannels() == 1) {
+            // Already a single channel image, return a duplicate
+            return imp.duplicate();
+        }
 
-        // Create a new image containing only the selected channel
+        // Save the current position of the original image
+        int currentC = imp.getC();
+        int currentZ = imp.getZ();
+        int currentT = imp.getT();
+
         int width = imp.getWidth();
         int height = imp.getHeight();
         int slices = imp.getNSlices();
         int frames = imp.getNFrames();
 
+        // Create a new stack for the selected channels
         ImageStack newStack = new ImageStack(width, height);
 
-        for (int t = 1; t <= frames; t++) {
-            for (int z = 1; z <= slices; z++) {
-                imp.setPosition(singleChannelToShow, z, t);
-                ImageProcessor processor = imp.getProcessor().duplicate();
-                newStack.addSlice(processor);
+        try {
+            // For each time point and Z slice
+            for (int t = 1; t <= frames; t++) {
+                for (int z = 1; z <= slices; z++) {
+                    // Add each selected channel to the stack
+                    for (int originalChannelIndex : channelIndices) {
+                        imp.setPosition(originalChannelIndex, z, t);
+                        ImageProcessor processor = imp.getProcessor().duplicate();
+                        newStack.addSlice(processor);
+                    }
+                }
             }
-        }
 
-        // Create new ImagePlus with the extracted channel
-        ImagePlus newImp = new ImagePlus(imp.getTitle() + " - Channel " + singleChannelToShow, newStack);
+            // Create new ImagePlus with the extracted channels
+            ImagePlus newImp = new ImagePlus(imp.getTitle() + " - Selected Channels", newStack);
 
-        // Set dimensions (now only one channel)
-        newImp.setDimensions(1, slices, frames);
+            // Set dimensions (now with only the selected channels)
+            newImp.setDimensions(channelIndices.length, slices, frames);
 
-        // Copy display ranges and other important settings
-        if (displayRangeCtoMin.containsKey(singleChannelToShow)) {
-            newImp.setDisplayRange(
-                    displayRangeCtoMin.get(singleChannelToShow),
-                    displayRangeCtoMax.containsKey(singleChannelToShow) ?
-                            displayRangeCtoMax.get(singleChannelToShow) :
-                            imp.getDisplayRangeMax()
-            );
-        }
+            // Apply display settings and LUTs for the selected channels
+            for (int i = 0; i < channelIndices.length; i++) {
+                int originalChannelIndex = channelIndices[i];
+                int newChannelIndex = i + 1; // 1-based indexing for new channels
 
-        // Apply the LUT if specified
-        if (cToLUTName.containsKey(singleChannelToShow)) {
-            IJ.run(newImp, cToLUTName.get(singleChannelToShow), "");
-        }
+                newImp.setC(newChannelIndex);
 
-        // Replace imp with this new single-channel image
-        imp = newImp;
+                // Apply display range if specified for the original channel
+                if (displayRangeCtoMin.containsKey(originalChannelIndex) || displayRangeCtoMax.containsKey(originalChannelIndex)) {
+                    double min = displayRangeCtoMin.getOrDefault(originalChannelIndex, newImp.getDisplayRangeMin());
+                    double max = displayRangeCtoMax.getOrDefault(originalChannelIndex, newImp.getDisplayRangeMax());
+                    newImp.setDisplayRange(min, max);
+                } else {
+                    // Apply auto contrast if no manual range was set
+                    IJ.run(newImp, "Enhance Contrast", "saturated=0.35");
+                }
 
-        // Update the maps to refer to channel 1 (the only channel now)
-        if (displayRangeCtoMin.containsKey(singleChannelToShow)) {
-            displayRangeCtoMin.put(1, displayRangeCtoMin.get(singleChannelToShow));
-        }
-        if (displayRangeCtoMax.containsKey(singleChannelToShow)) {
-            displayRangeCtoMax.put(1, displayRangeCtoMax.get(singleChannelToShow));
-        }
-        if (cToLUTName.containsKey(singleChannelToShow)) {
-            cToLUTName.put(1, cToLUTName.get(singleChannelToShow));
+                // Apply LUT if specified for the original channel
+                if (cToLUTName.containsKey(originalChannelIndex)) {
+                    IJ.run(newImp, cToLUTName.get(originalChannelIndex), "");
+                }
+            }
+
+            return newImp;
+
+        } finally {
+            // Always restore the original image's position
+            imp.setPosition(currentC, currentZ, currentT);
         }
     }
 
@@ -625,12 +580,6 @@ public class ImageFormatter {
         else IJ.run(img, "Enhance Contrast", "saturated=0.35");
         if (cToLUTName.containsKey(c))
             IJ.run(img, cToLUTName.get(c), "");
-        else if (c == 1)
-            IJ.run(img, "Blue", "");
-        else if (c == 2)
-            IJ.run(img, "Magenta", "");
-        else if (c == 3)
-            IJ.run(img, "Green", "");
     }
 
     /**
@@ -782,15 +731,9 @@ public class ImageFormatter {
      *
      * @param g The graphics context to draw to
      */
-    private void drawToGraphics(Graphics2D g) {
+    private void drawToGraphics(ImagePlus mergedImage, Graphics2D g) {
         // Setup transformation and bounds
         bounds = new Rectangle2D.Double(xMinValue, yMinValue, xMaxValue - xMinValue, yMaxValue - yMinValue);
-
-        // Set up the background
-        //if (darkTheme) {
-            //g.setColor(Color.BLACK);
-            //g.fillRect(0, 0, image.getWidth(), image.getHeight());
-        //}
 
         // Enable anti-aliasing for smoother lines and text
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
@@ -798,10 +741,10 @@ public class ImageFormatter {
 
         if (rightVerticalOrientation || leftVerticalOrientation) {
             // Draw rotated content
-            drawRotatedContent(g);
+            drawRotatedContent(mergedImage, g);
         } else {
             // Draw standard horizontal content
-            drawHorizontalContent(g);
+            drawHorizontalContent(mergedImage, g);
         }
 
         // Draw title
@@ -817,14 +760,14 @@ public class ImageFormatter {
      *
      * @param g The graphics context to draw to
      */
-    private void drawHorizontalContent(Graphics2D g) {
+    private void drawHorizontalContent(ImagePlus mergedImage, Graphics2D g) {
         transform = new AffineTransform();
         transform.translate(horizontalMargin, verticalMargin + imp.getHeight());
         transform.scale(imp.getWidth() / bounds.width, -imp.getHeight() / bounds.height);
         transform.translate(-bounds.x, -bounds.y);
 
         // Draw main image
-        g.drawImage(imp.getBufferedImage(), horizontalMargin, verticalMargin, null);
+        g.drawImage(mergedImage.getBufferedImage(), horizontalMargin, verticalMargin, null);
 
         // Draw y-axis if enabled
         if (showYAxis) paintYAxis(g, verticalMargin, verticalMargin + imp.getHeight());
@@ -833,25 +776,27 @@ public class ImageFormatter {
         int totalHeight = verticalMargin + imp.getHeight();
 
         // Draw channel stack if enabled
-        if (channelStack && imp.getNChannels() > 1) {
-            for (int c=1; c<=imp.getNChannels(); c++) {
-                // Calculate the vertical position for this channel
-                int yPos = verticalMargin + c*(imp.getHeight() + channelStackspacing);
+        if (channelStack && mergedImage.getNChannels() > 1) {
+            int stackIndex = 1; // Sequential index for positioning
+            for (int originalChannelIndex : multipleChannelsToShow) {
+                // Calculate the vertical position for this channel using sequential index
+                int yPos = verticalMargin + stackIndex*(imp.getHeight() + channelStackspacing);
 
                 transform = new AffineTransform();
                 transform.translate(horizontalMargin, yPos + imp.getHeight());
                 transform.scale(imp.getWidth() / bounds.width, -imp.getHeight() / bounds.height);
                 transform.translate(-bounds.x, -bounds.y);
 
-                imp.setC(c);
+                imp.setC(originalChannelIndex);
                 ImagePlus temp = new ImagePlus("temp image", imp.getChannelProcessor());
-                updateChannelColor(temp, c);
+                updateChannelColor(temp, originalChannelIndex);
                 g.drawImage(temp.getBufferedImage(), horizontalMargin, yPos, null);
 
                 if (showYAxis) paintYAxis(g, yPos, yPos + imp.getHeight());
 
                 // Update the total height
                 totalHeight = yPos + imp.getHeight();
+                stackIndex++; // Increment for next channel position
             }
         }
 
@@ -864,12 +809,12 @@ public class ImageFormatter {
      *
      * @param g The graphics context to draw to
      */
-    private void drawRotatedContent(Graphics2D g) {
+    private void drawRotatedContent(ImagePlus mergedImage, Graphics2D g) {
         // For vertical orientation, we swap width and height
         boolean rightRotation = rightVerticalOrientation;
 
         // Draw main image (rotated)
-        BufferedImage originalImage = imp.getBufferedImage();
+        BufferedImage originalImage = mergedImage.getBufferedImage();
         int width = originalImage.getWidth();
         int height = originalImage.getHeight();
 
@@ -920,21 +865,20 @@ public class ImageFormatter {
         }
 
         // Draw channel stack if enabled and there are multiple channels
-        if (channelStack && imp.getNChannels() > 1) {
-            // Make sure we have proper spacing between main image and first channel column
-            // Apply spacing between main image and first channel
+        if (channelStack && mergedImage.getNChannels() > 1) {
             int mainImageEndX = horizontalMargin + columnWidth;
+            int stackIndex = 0; // Sequential index for positioning
 
-            for (int c = 1; c <= imp.getNChannels(); c++) {
-                imp.setC(c);
+            for (int originalChannelIndex : multipleChannelsToShow) {
+                imp.setC(originalChannelIndex);
                 ImagePlus temp = new ImagePlus("temp image", imp.getChannelProcessor());
-                updateChannelColor(temp, c);
+                updateChannelColor(temp, originalChannelIndex);
 
                 BufferedImage channelImage = temp.getBufferedImage();
 
-                // Calculate horizontal position for this channel's column
+                // Calculate horizontal position for this channel's column using sequential index
                 // First channel starts after main image + spacing
-                int columnPosition = mainImageEndX + channelStackspacing + (c-1)*(columnWidth + channelStackspacing);
+                int columnPosition = mainImageEndX + channelStackspacing + stackIndex*(columnWidth + channelStackspacing);
 
                 AffineTransform channelTransform = new AffineTransform();
                 if (rightRotation) {
@@ -956,6 +900,8 @@ public class ImageFormatter {
                             columnPosition, columnPosition + columnWidth,
                             "", yStepSize, bounds.y, bounds.height, yaxis_precision);
                 }
+
+                stackIndex++; // Increment for next channel position
             }
         }
     }
@@ -1188,7 +1134,7 @@ public class ImageFormatter {
             svgGenerator.setSVGCanvasSize(new Dimension(image.getWidth(), image.getHeight()));
 
             // Draw content
-            drawToGraphics(svgGenerator);
+            drawToGraphics(mergedImage, svgGenerator);
 
             // Write to file
             try (Writer out = new OutputStreamWriter(new FileOutputStream(path), "UTF-8")) {
